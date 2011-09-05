@@ -1,20 +1,24 @@
 package Business::OnlinePayment::Beanstream;
 
 use strict;
+use URI::Escape;
 use Business::OnlinePayment;
-use Net::SSLeay qw/make_form post_https/;
-use vars qw/@ISA $VERSION @EXPORT @EXPORT_OK/;
+use Business::OnlinePayment::HTTPS;
+use vars qw/@ISA $VERSION $DEBUG @EXPORT @EXPORT_OK/;
 
-@ISA=qw(Exporter AutoLoader Business::OnlinePayment);
+@ISA=qw(Exporter AutoLoader Business::OnlinePayment::HTTPS);
 @EXPORT=qw();
 @EXPORT_OK=qw();
-$VERSION='0.01';
+$VERSION='0.02';
+$DEBUG = 0;
 
 sub set_defaults{
   my $self = shift;
   $self->server('www.beanstream.com');
   $self->port('443');
   $self->path('/scripts/process_transaction.asp');
+
+  $self->build_subs(qw( order_number avs_code ));
 }
 
 sub map_fields{
@@ -23,9 +27,13 @@ sub map_fields{
 
   my %actions = ( 'normal authorization' => 'P', 
                   'authorization only'   => 'PA',
+                  'post authorization'   => 'PAC',
+                  'credit'               => 'R',  # not really supported yet
                 );
   $content{action} = $actions{lc $content{action}} || $content{action};
-  
+  $content{requestType} = 'BACKEND';
+  $content{expiration} ||= $content{exp_date};  # backward-compatibility 0.01
+  # owner | company | name
   $self->content(%content);
 }
 
@@ -47,11 +55,19 @@ sub get_fields{
 }
   
 
-sub submit{
+sub submit {
   my $self = shift;
- 
-  $self->map_fields();
-  $self->remap_fields(
+
+  # Re: test_transaction - test mode is set on/off in the merchant account
+  # settings.  No info on convenient way to set test mode per transaction.
+
+  if ($DEBUG > 3)  {
+     my %params = $self->content;
+     warn join("\n", map { "  $_ => $params{$_}" } keys %params );
+  }
+
+  $self->map_fields();                 # set values with special handling
+  $self->remap_fields(                 # rename keys
     login          => 'merchant_id',
     action         => 'trnType',
     description    => 'trnComments',
@@ -67,12 +83,17 @@ sub submit{
     phone          => 'ordPhoneNumber',
     email          => 'ordEmailAddress',
     card_number    => 'trnCardNumber',
-    exp_date       => 'trnExpYear',
+    expiration     => 'trnExpYear',
+    order_number   => 'adjId',
   );
 
-  $self->required_fields( qw/login amount invoice_number name address city 
-                             state zip country phone email card_number 
-                             exp_date owner/ );
+  # Credits/Returns/Adjustments with Beanstream, are not currently supported.
+  # would req: login, inv-num, action/trnType, username, password, adjId, amt
+  # Yes Beanstream really require phone & email, for Sales/Purchases
+  my @required = qw/login amount invoice_number name address city 
+                             state zip country phone card_number
+                             expiration owner/;
+  $self->required_fields(@required);
   
   # We should prepare some fields to posting, for instance ordAddress1 should be cutted and trnExpYear 
   # should be separated to trnExpMonth and trnExpYear
@@ -82,64 +103,88 @@ sub submit{
   ($content{ordAddress1}, $content{ordAddress2}) = unpack 'A32 A*', $address;
   
   my $date = $content{trnExpYear};
-  ($content{trnExpMonth},$content{trnExpYear}) = ($date =~/\//)? 
-                                                  split /\//,$date: 
-                                                  unpack 'A2 A2',$date;
+  ($content{trnExpMonth},$content{trnExpYear}) = ($date =~/\//) ?
+                                                  split /\//, $date :
+                                                  unpack 'A2 A2', $date;
   
   $self->content(%content);
   
   # Now we are ready to post request
   
-  my %post_data = $self->get_fields( qw/merchant_id trnType trnComments 
-                                        trnAmount trnOrderNumber trnCardNumber 
-                                        trnExpYear trnExpMonth trnCardOwner 
-                                        ordName ordAddress1 ordCity ordProvince
-                                        ordPostalCode ordCountry ordPhoneNumber
-                                        ordEmailAddress/ );
-  $post_data{errorPage} = 'www.yahoo.com'; 
-  my $pd = make_form(%post_data);
-  my ($page,$server_response,%headers) = post_https( $self->server(),
-                                                     $self->port(),
-                                                     $self->path(),
-                                                     '',
-                                                     $pd,
-                                                   );
-  $self->response_code($server_response);
-  $self->response_headers(%headers);
+  my %params = $self->get_fields( qw/merchant_id trnType trnComments
+                                     trnAmount trnOrderNumber trnCardNumber
+                                     trnExpYear trnExpMonth trnCardOwner
+                                     ordName ordAddress1 ordCity ordProvince
+                                     ordPostalCode ordCountry ordPhoneNumber
+                                     ordEmailAddress requestType/ );
+
+  warn join("\n", map { "  $_ => $params{$_}" } keys %params )
+    if $DEBUG > 3;
+
+  # Send transaction to Beanstream
+  my ($page, $server_response, %headers) = $self->https_post( \%params );
+
+  # Convert multi-line error to a single line.
+  $server_response =~ s/[\r\n]+/ /g;
   
   # Handling server response
-  
-  if ($server_response =~/200 OK/){
-    
-    $self->is_success(0);
-    $self->error_message($page);
+  if ($server_response != 200  and  $server_response !~ /200 OK/)  {
+      # Connection error
+      $self->is_success(0);
+      my $diag_message = $server_response || "connection error";
+      warn $diag_message  if $DEBUG;
+      $self->result_code( $diag_message );
+      $self->error_message( $diag_message );
+  }  else  {
+
+    if ($DEBUG > 3)  {
+      warn $page;  # how helpful are %headers?
+    }
     $self->server_response($page);
-    
-  }elsif ($server_response =~/30\d /){
-    
-    $headers{LOCATION} =~s/\+/ /g;
-    $headers{LOCATION} =~s/%([\dA-Fa-f]{2})/chr(hex($1))/ge;
-    $headers{LOCATION} =~s/^[^?]+\?//;
-    $self->server_response($headers{LOCATION});
+
     my %fields; 
-    for (split /&/, $headers{LOCATION}){
-      my ($key,$value) = split '=',$_;
-      $fields{$key} = $value;
+    for my $pair (split /&/, $page) {
+      my ($key, $value) = split '=', $pair;
+      $fields{$key} = URI::Escape::uri_unescape($value);
+      $fields{$key} =~ tr/+/ /;
     }
-    
-    if ($fields{errorMessage}){
-      $self->is_success(0);
-      $self->error_message($fields{errorMessage}.$fields{errorFields});
-    }elsif ($fields{messageId} =~/^[129]$/){
+    warn join("\n", map { "  $_ => $fields{$_}" } keys %fields )
+      if $DEBUG > 2;
+
+    $self->result_code($fields{messageId});
+    # Was messageId =~/^[129]$/, but 9 is not approved per Reporting-Guide,
+    # and there are approval codes in 61..70, 561.
+    if ($fields{trnApproved}) {
       $self->is_success(1);
-      $self->result_code($fields{messageId});
       $self->authorization($fields{messageText});
-    }else {
+      $self->order_number($fields{trnId});
+    } else {
       $self->is_success(0);
-      $self->result_code($fields{messageId});
-      $self->error_message($fields{messageText});
+      if ($fields{errorMessage}) {
+	 $self->error_message($fields{errorMessage});
+      } else {
+	 $self->error_message($fields{messageText});
+      }
     }
-    
+
+    # avs_code - Process-Transaction-API-Guide.pdf 1.6.3
+    my %avsTable = (0 => '',
+		    5 => 'E',
+		    9 => 'E',
+		    A => 'A',
+		    B => 'A',
+		    C => '',
+		    D => 'Y',
+		    E => 'E',
+		    G => '',
+		    I => '',
+		    M => 'Y',
+		    N => 'N',
+		    P => 'Z',
+		    R => 'R',
+		    );
+    $self->avs_code($avsTable{$fields{avsAddrMatch}});
+
   }
 }
 
@@ -171,7 +216,7 @@ Business::OnlinePayment::Beanstream - Beanstream backend for Business::OnlinePay
 
   use Business::OnlinePayment;
   
-  my $tr = Business::OnlinePayment->new('Beanstream');
+  my $tr = Business::OnlinePayment->new('Beanstream'); 
   $tr->content(
     login          => '100200000',
     action         => 'Normal Authorization',
@@ -179,7 +224,7 @@ Business::OnlinePayment::Beanstream - Beanstream backend for Business::OnlinePay
     invoice_number => '56647',
     owner          => 'John Doe',
     card_number    => '312312312312345',
-    exp_date       => '0505',
+    expiration     => '1212',
     name           => 'Sam Shopper',
     address        => '123 Any Street',
     city           => 'Los Angeles',
@@ -215,7 +260,7 @@ This module allows you to link any e-commerce order processing system directly t
 
 =item card_number - number of the credit card
 
-=item exp_date - expiration date formated as 'mmyy' or 'mm/yy'
+=item expiration - expiration date formated as 'mmyy' or 'mm/yy'
 
 =item name - name of the billing person
 
@@ -225,7 +270,7 @@ This module allows you to link any e-commerce order processing system directly t
 
 =item state - billing address state/province
 
-=item zip - billing address zip/postal code
+=item zip - billing address ZIP/postal code
 
 =item country - billing address country
 
